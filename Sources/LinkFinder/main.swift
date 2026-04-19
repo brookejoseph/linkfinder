@@ -74,6 +74,7 @@ struct VerificationResult: Codable {
 struct ScanAccumulator {
     var urlCandidates: [String: DeepLinkCandidate] = [:]
     var bundleIdentifiers: [String: String] = [:]
+    var routeTokens: [String: String] = [:]
     var filesVisited = 0
     var filesScanned = 0
     var filesSkipped = 0
@@ -90,6 +91,8 @@ let textExtensions: Set<String> = [
     "txt",
     "xml"
 ]
+
+let bundleIDRegex = try! NSRegularExpression(pattern: #"\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9][A-Za-z0-9_-]+){2,}\b"#)
 
 do {
     let (command, appPath, options) = try parseArguments(Array(CommandLine.arguments.dropFirst()))
@@ -216,6 +219,7 @@ func scanApp(at inputPath: String, options: ScanOptions) throws -> ScanReport {
         )
     }
     candidates += Array(accumulator.urlCandidates.values)
+    candidates += inferredRouteCandidates(schemes: schemes, routeTokens: accumulator.routeTokens)
     candidates = ranked(candidates)
 
     if candidates.count > options.limit {
@@ -303,7 +307,7 @@ func scanBundle(_ bundleURL: URL, executableURL: URL?, options: ScanOptions) -> 
             break
         }
 
-        if (values?.fileSize ?? 0) > options.maxFileBytes {
+        if url != executableURL && (values?.fileSize ?? 0) > options.maxFileBytes {
             accumulator.filesSkipped += 1
             continue
         }
@@ -316,6 +320,7 @@ func scanBundle(_ bundleURL: URL, executableURL: URL?, options: ScanOptions) -> 
         accumulator.filesScanned += 1
         collectURLs(in: text, source: relativePath(url, under: bundleURL), accumulator: &accumulator)
         collectBundleIDs(in: text, source: relativePath(url, under: bundleURL), accumulator: &accumulator)
+        collectRouteTokens(in: text, source: relativePath(url, under: bundleURL), accumulator: &accumulator)
     }
 
     return accumulator
@@ -342,24 +347,103 @@ func isLikelyBinary(_ url: URL) -> Bool {
 }
 
 func collectURLs(in text: String, source: String, accumulator: inout ScanAccumulator) {
-    for value in matches(#"\b[a-z][a-z0-9+.-]{1,40}:(?:(?:\/\/)?[^\s"'`<>)}\]]+|[A-Za-z0-9._~/?#[\]@!$&()*+,;=%-]+)"#, in: text) {
-        let url = cleanup(value)
-        guard isUsefulURL(url), accumulator.urlCandidates[url] == nil else { continue }
-        accumulator.urlCandidates[url] = DeepLinkCandidate(
-            url: url,
-            confidence: "found",
-            source: source,
-            reason: "This URL-like string appears in the app bundle."
-        )
+    for rawLine in text.split(whereSeparator: \.isNewline) {
+        for rawToken in rawLine.split(whereSeparator: \.isWhitespace) {
+            let url = cleanup(String(rawToken))
+            guard isUsefulURL(url), accumulator.urlCandidates[url] == nil else { continue }
+            accumulator.urlCandidates[url] = DeepLinkCandidate(
+                url: url,
+                confidence: "found",
+                source: source,
+                reason: "This URL-like string appears in the app bundle."
+            )
+        }
     }
 }
 
 func collectBundleIDs(in text: String, source: String, accumulator: inout ScanAccumulator) {
-    for value in matches(#"\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9][A-Za-z0-9_-]+){2,}\b"#, in: text) {
-        let identifier = cleanup(value)
-        guard isUsefulBundleID(identifier), accumulator.bundleIdentifiers[identifier] == nil else { continue }
-        accumulator.bundleIdentifiers[identifier] = source
+    for rawLine in text.split(whereSeparator: \.isNewline) {
+        let line = String(rawLine)
+        guard line.contains("."), line.count < 300 else { continue }
+        for value in matches(bundleIDRegex, in: line) {
+            let identifier = cleanup(value)
+            guard isUsefulBundleID(identifier), accumulator.bundleIdentifiers[identifier] == nil else { continue }
+            accumulator.bundleIdentifiers[identifier] = source
+        }
     }
+}
+
+func collectRouteTokens(in text: String, source: String, accumulator: inout ScanAccumulator) {
+    for rawLine in text.split(whereSeparator: \.isNewline) {
+        let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let token = routeToken(from: line), accumulator.routeTokens[token] == nil {
+            accumulator.routeTokens[token] = source
+        }
+
+        if let token = routeTokenFromShowSelector(line), accumulator.routeTokens[token] == nil {
+            accumulator.routeTokens[token] = source
+        }
+    }
+}
+
+func routeTokenFromShowSelector(_ line: String) -> String? {
+    guard line.hasPrefix("show"), line.count <= 64 else { return nil }
+    let suffix = line.dropFirst("show".count)
+    guard let first = suffix.first, first.isUppercase else { return nil }
+    let rawToken = first.lowercased() + suffix.dropFirst()
+    guard isLikelyRouteToken(rawToken) else { return nil }
+    return rawToken
+}
+
+func routeToken(from line: String) -> String? {
+    let cleaned = cleanup(line)
+    guard isLikelyRouteToken(cleaned) else { return nil }
+    return cleaned
+}
+
+func isLikelyRouteToken(_ value: String) -> Bool {
+    if value.count < 2 || value.count > 48 { return false }
+    if value.range(of: #"^[a-z][A-Za-z0-9_-]*$"#, options: .regularExpression) == nil { return false }
+
+    let lower = value.lowercased()
+    let exact: Set<String> = [
+        "account",
+        "devices",
+        "favorites",
+        "friends",
+        "home",
+        "inbox",
+        "items",
+        "itemsThatCanTrackYou",
+        "me",
+        "meExpanded",
+        "notifications",
+        "people",
+        "profile",
+        "search",
+        "settings",
+        "shared",
+        "sharing",
+        "unknownItems",
+        "unknownitems"
+    ]
+    if exact.contains(value) || exact.contains(lower) { return true }
+    return false
+}
+
+func inferredRouteCandidates(schemes: [String], routeTokens: [String: String]) -> [DeepLinkCandidate] {
+    var candidates: [DeepLinkCandidate] = []
+    for scheme in schemes {
+        for (token, source) in routeTokens {
+            candidates.append(DeepLinkCandidate(
+                url: "\(scheme)://\(token)",
+                confidence: "inferred",
+                source: source,
+                reason: "This combines a declared URL scheme with a route-like token found in the app bundle."
+            ))
+        }
+    }
+    return candidates
 }
 
 func discoverSystemSettingsPanes(_ bundleURL: URL, info: [String: Any], accumulator: ScanAccumulator) -> [SettingsPane] {
@@ -453,6 +537,7 @@ func rank(_ confidence: String) -> Int {
     switch confidence {
     case "declared": return 3
     case "likely": return 2
+    case "inferred": return 1
     case "found": return 1
     default: return 0
     }
@@ -463,8 +548,7 @@ func readPlist(_ url: URL) -> Any? {
     return try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
 }
 
-func matches(_ pattern: String, in text: String) -> [String] {
-    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+func matches(_ regex: NSRegularExpression, in text: String) -> [String] {
     let range = NSRange(text.startIndex..<text.endIndex, in: text)
     return regex.matches(in: text, range: range).compactMap {
         Range($0.range, in: text).map { String(text[$0]) }
@@ -476,7 +560,10 @@ func cleanup(_ value: String) -> String {
 }
 
 func isUsefulURL(_ url: String) -> Bool {
-    guard let scheme = url.split(separator: ":").first?.lowercased(), !scheme.isEmpty else { return false }
+    guard let colon = url.firstIndex(of: ":") else { return false }
+    let scheme = String(url[..<colon]).lowercased()
+    guard scheme.range(of: #"^[a-z][a-z0-9+.-]{1,40}$"#, options: .regularExpression) != nil else { return false }
+    if !url.contains("://") && !scheme.hasPrefix("x-") { return false }
     if ["file", "data", "javascript", "mailto"].contains(String(scheme)) { return false }
     if url.count > 500 { return false }
     if url.range(of: #"^https?://(www\.)?w3\.org/"#, options: [.regularExpression, .caseInsensitive]) != nil { return false }
@@ -505,9 +592,9 @@ func run(_ executable: String, _ arguments: [String]) -> (status: Int32, output:
 
     do {
         try process.run()
-        process.waitUntilExit()
         let output = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let error = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        process.waitUntilExit()
         return (process.terminationStatus, output, error)
     } catch {
         return (127, "", error.localizedDescription)
